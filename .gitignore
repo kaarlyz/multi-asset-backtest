@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.duckdb
+*.duckdb.wal
+data/parquet/*
+!data/parquet/market/
+!data/parquet/fundamentals/
+!data/parquet/news/
+!data/parquet/macro/

@@ -1,0 +1,17 @@
+sources:
+  binance_s3:
+    base_url: "https://data.binance.vision/data/spot"
+    publication_lag_seconds: 10
+    market_types: ["daily", "monthly"]
+    intervals: ["1d", "1h"]
+
+  defillama:
+    base_url: "https://api.llama.fi"
+    endpoints:
+      historical_chain_tvl: "/v2/historicalChainTvl/{chain}"
+      protocol_tvl: "/protocol/{protocol}"
+    publication_lag_seconds: 300 # 5 minutes
+
+storage:
+  duckdb_path: "data/chronos.duckdb"
+  parquet_root: "data/parquet"

@@ -1,0 +1,19 @@
+assets:
+  - asset_id: "CRYPTO_BTC"
+    asset_class: "CRYPTO"
+    symbol: "BTCUSDT"
+    base_asset: "BTC"
+    quote_asset: "USDT"
+    is_active: true
+  - asset_id: "CRYPTO_ETH"
+    asset_class: "CRYPTO"
+    symbol: "ETHUSDT"
+    base_asset: "ETH"
+    quote_asset: "USDT"
+    is_active: true
+  - asset_id: "CRYPTO_SOL"
+    asset_class: "CRYPTO"
+    symbol: "SOLUSDT"
+    base_asset: "SOL"
+    quote_asset: "USDT"
+    is_active: true
