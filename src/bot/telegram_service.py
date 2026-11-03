@@ -227,9 +227,10 @@ class TelegramBotService:
 
         pos_str = "None"
         if positions:
+            pos_items = list(positions.values()) if isinstance(positions, dict) else positions
             pos_lines = [
                 f" - {p.get('symbol', 'UNKNOWN')}: {p.get('size', 0)} @ ${p.get('entry_price', 0):,.2f}"
-                for p in positions
+                for p in pos_items
             ]
             pos_str = "\n".join(pos_lines)
 
@@ -364,7 +365,8 @@ class TelegramBotService:
             }
 
         # 3. Idempotency Guard against decision_ledger
-        if self.db is not None and self.db.has_decision(decision_id):
+        existing_dec = self.db.get_decision(decision_id) if self.db is not None else None
+        if existing_dec is not None and existing_dec.get("status") in ("RECORDED", "EXECUTED"):
             if callback_id:
                 self.answer_callback_query(
                     callback_query_id=callback_id,
@@ -394,25 +396,35 @@ class TelegramBotService:
         entry_price = float(bar["close"]) if bar and "close" in bar else None
 
         if self.db is not None:
-            try:
-                self.db.record_decision(
+            if existing_dec is not None:
+                self.db.update_decision(
                     decision_id=decision_id,
-                    sim_run_id=sim_run_id,
-                    sim_time=sim_time,
-                    asset_id=asset_id,
-                    interface="TELEGRAM",
-                    actor_id=str(user_id),
                     action=action,
-                    entry_price=entry_price,
+                    actor_id=str(user_id),
+                    interface="TELEGRAM",
                     status="RECORDED",
+                    entry_price=entry_price,
                 )
-            except Exception as e:
-                # Primary key collision caught by DB constraint
-                return {
-                    "status": "REJECTED_ALREADY_DECIDED",
-                    "decision_id": decision_id,
-                    "error": str(e),
-                }
+            else:
+                try:
+                    self.db.record_decision(
+                        decision_id=decision_id,
+                        sim_run_id=sim_run_id,
+                        sim_time=sim_time,
+                        asset_id=asset_id,
+                        interface="TELEGRAM",
+                        actor_id=str(user_id),
+                        action=action,
+                        entry_price=entry_price,
+                        status="RECORDED",
+                    )
+                except Exception as e:
+                    # Primary key collision caught by DB constraint
+                    return {
+                        "status": "REJECTED_ALREADY_DECIDED",
+                        "decision_id": decision_id,
+                        "error": str(e),
+                    }
 
         # 5. Acknowledge callback query
         if callback_id:
@@ -437,3 +449,24 @@ class TelegramBotService:
         elif "callback_query" in update:
             return self.handle_callback(update["callback_query"])
         return {"status": "IGNORED", "update_id": update.get("update_id")}
+
+    def get_updates(
+        self, offset: Optional[int] = None, timeout: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Fetch updates via Telegram long-polling."""
+        if not self.token:
+            return []
+        params: Dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            resp = self.http_client.get(
+                f"{self.base_url}/getUpdates", params=params, timeout=timeout + 5.0
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    return data.get("result", [])
+        except Exception:
+            pass
+        return []

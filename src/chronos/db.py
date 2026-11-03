@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Union
 import duckdb
 
@@ -8,6 +9,7 @@ import duckdb
 class ChronosDB:
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = str(db_path)
+        self._lock = threading.RLock()
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = duckdb.connect(self.db_path)
@@ -17,7 +19,8 @@ class ChronosDB:
         schema_path = Path(__file__).parent / "schema.sql"
         with open(schema_path, "r", encoding="utf-8") as f:
             sql = f.read()
-        self.conn.execute(sql)
+        with self._lock:
+            self.conn.execute(sql)
 
     def insert_asset(
         self,
@@ -28,14 +31,15 @@ class ChronosDB:
         quote_asset: str,
         is_active: bool = True,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO dim_assets 
-            (asset_id, asset_class, symbol, base_asset, quote_asset, is_active)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [asset_id, asset_class, symbol, base_asset, quote_asset, is_active],
-        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO dim_assets 
+                (asset_id, asset_class, symbol, base_asset, quote_asset, is_active)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [asset_id, asset_class, symbol, base_asset, quote_asset, is_active],
+            )
 
     def insert_fundamental_pit(
         self,
@@ -128,50 +132,82 @@ class ChronosDB:
             evidence_json = evidence_snapshot
 
         # Strictly enforces primary key idempotency (fails on duplicate decision_id)
-        self.conn.execute(
-            """
-            INSERT INTO decision_ledger
-            (decision_id, sim_run_id, sim_time, asset_id, interface, actor_id, action,
-             agent_confidence, evidence_snapshot, entry_price, stop_loss, take_profit, position_size, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                decision_id,
-                sim_run_id,
-                sim_time,
-                asset_id,
-                interface,
-                actor_id,
-                action,
-                agent_confidence,
-                evidence_json,
-                entry_price,
-                stop_loss,
-                take_profit,
-                position_size,
-                status,
-            ],
-        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO decision_ledger
+                (decision_id, sim_run_id, sim_time, asset_id, interface, actor_id, action,
+                 agent_confidence, evidence_snapshot, entry_price, stop_loss, take_profit, position_size, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    decision_id,
+                    sim_run_id,
+                    sim_time,
+                    asset_id,
+                    interface,
+                    actor_id,
+                    action,
+                    agent_confidence,
+                    evidence_json,
+                    entry_price,
+                    stop_loss,
+                    take_profit,
+                    position_size,
+                    status,
+                ],
+            )
 
     def has_decision(self, decision_id: str) -> bool:
         """Check if decision_id already exists in decision_ledger (for idempotency checks)."""
-        row = self.conn.execute(
-            "SELECT count(*) FROM decision_ledger WHERE decision_id = ?",
-            [decision_id],
-        ).fetchone()
-        return bool(row and row[0] > 0)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT count(*) FROM decision_ledger WHERE decision_id = ?",
+                [decision_id],
+            ).fetchone()
+            return bool(row and row[0] > 0)
 
     def get_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a recorded decision by decision_id."""
-        cursor = self.conn.execute(
-            "SELECT * FROM decision_ledger WHERE decision_id = ?",
-            [decision_id],
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        cols = [desc[0] for desc in cursor.description]
-        return dict(zip(cols, row))
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT * FROM decision_ledger WHERE decision_id = ?",
+                [decision_id],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [desc[0] for desc in cursor.description]
+            return dict(zip(cols, row))
+
+    def update_decision(
+        self,
+        decision_id: str,
+        action: str,
+        actor_id: str,
+        interface: str = "TELEGRAM",
+        status: str = "RECORDED",
+        entry_price: Optional[float] = None,
+    ) -> None:
+        """Update decision row upon callback or execution."""
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE decision_ledger
+                SET action = ?, actor_id = ?, interface = ?, status = ?, entry_price = COALESCE(?, entry_price)
+                WHERE decision_id = ?
+                """,
+                [action, actor_id, interface, status, entry_price, decision_id],
+            )
+
+    def update_decision_status(self, decision_id: str, status: str) -> None:
+        """Update decision status in ledger."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE decision_ledger SET status = ? WHERE decision_id = ?",
+                [status, decision_id],
+            )
 
     def get_crypto_snapshot(
         self,
