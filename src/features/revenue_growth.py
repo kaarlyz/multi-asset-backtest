@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Union
@@ -54,8 +54,11 @@ def _compute_yoy_for_concept(
     if not history:
         return None
 
-    # Filter for quarterly facts (approx 3-month duration)
+    # Filter for quarterly facts (approx 3-month duration) and annual/9-month facts for Q4 derivation
     quarterly_records: List[Dict[str, Any]] = []
+    annual_10k_by_fy: Dict[int, List[Dict[str, Any]]] = {}
+    nine_month_records: List[Dict[str, Any]] = []
+
     for h in history:
         try:
             d1 = datetime.strptime(str(h["period_start"]), "%Y-%m-%d")
@@ -66,6 +69,7 @@ def _compute_yoy_for_concept(
 
         form = str(h.get("form", "")).upper()
         fp = str(h.get("fiscal_period", "")).upper()
+        fy = int(h.get("fiscal_year") or 0)
 
         # 10-Q quarters are ~90 days (60-120 days)
         # 10-K Q4 is also ~90 days
@@ -74,6 +78,71 @@ def _compute_yoy_for_concept(
             form == "10-Q" or (form == "10-K" and fp in ("Q4", "FY", ""))
         ):
             quarterly_records.append(h)
+
+        if duration_days >= 330 and form == "10-K" and fp in ("FY", "Q4", "") and fy > 0:
+            annual_10k_by_fy.setdefault(fy, []).append(h)
+
+        if 240 <= duration_days <= 300 and form == "10-Q" and fp == "Q3":
+            nine_month_records.append(h)
+
+    # Derive standalone Q4 records from 10-K and 10-Q Q3 9-month facts
+    for fy, ten_ks in sorted(annual_10k_by_fy.items()):
+        ten_ks.sort(key=lambda x: (str(x["period_end"]), str(x["accepted_datetime"])))
+        ten_k = ten_ks[-1]
+
+        # Check if standard 3-month Q4 already exists for this period_end
+        has_standalone = any(
+            str(q.get("period_end")) == str(ten_k["period_end"])
+            for q in quarterly_records
+        )
+        if has_standalone:
+            continue
+
+        matching_9m = [
+            m for m in nine_month_records
+            if str(m.get("period_start")) == str(ten_k["period_start"])
+            and m.get("unit") == ten_k.get("unit")
+            and m.get("cik") == ten_k.get("cik")
+            and m.get("concept") == ten_k.get("concept")
+        ]
+        if not matching_9m:
+            continue
+
+        matching_9m.sort(key=lambda x: str(x["accepted_datetime"]))
+        q3_9m = matching_9m[-1]
+
+        q4_val = float(ten_k["val"]) - float(q3_9m["val"])
+        d_q3_end = datetime.strptime(str(q3_9m["period_end"]), "%Y-%m-%d")
+        q4_period_start = (d_q3_end + timedelta(days=1)).strftime("%Y-%m-%d")
+        q4_period_end = str(ten_k["period_end"])
+
+        ten_k_acc = ten_k["accepted_datetime"]
+        if hasattr(ten_k_acc, "tzinfo") and ten_k_acc.tzinfo is None:
+            ten_k_acc = ten_k_acc.replace(tzinfo=timezone.utc)
+        q3_acc = q3_9m["accepted_datetime"]
+        if hasattr(q3_acc, "tzinfo") and q3_acc.tzinfo is None:
+            q3_acc = q3_acc.replace(tzinfo=timezone.utc)
+        q4_accepted_datetime = max(ten_k_acc, q3_acc)
+
+        q4_provenance = f"{ten_k['accession_number']}+{q3_9m['accession_number']}"
+
+        derived_rec = {
+            "cik": ten_k["cik"],
+            "entity_name": ten_k.get("entity_name", ""),
+            "concept": ten_k["concept"],
+            "accession_number": q4_provenance,
+            "form": "10-K (derived Q4)",
+            "filed_date": ten_k.get("filed_date", ""),
+            "accepted_datetime": q4_accepted_datetime,
+            "period_start": q4_period_start,
+            "period_end": q4_period_end,
+            "fiscal_year": int(ten_k.get("fiscal_year") or fy),
+            "fiscal_period": "Q4",
+            "val": q4_val,
+            "unit": ten_k["unit"],
+            "is_derived": True,
+        }
+        quarterly_records.append(derived_rec)
 
     if not quarterly_records:
         return None
@@ -130,7 +199,14 @@ def _compute_yoy_for_concept(
         return None
 
     growth_yoy = (curr_val - prev_val) / abs(prev_val)
-    accessions = sorted(list({curr["accession_number"], prev["accession_number"]}))
+    accessions_set = set()
+    for item in (curr, prev):
+        acc = item.get("accession_number", "")
+        if acc:
+            for part in str(acc).split("+"):
+                if part.strip():
+                    accessions_set.add(part.strip())
+    accessions = sorted(list(accessions_set))
 
     return {
         "as_of_datetime": as_of_datetime,

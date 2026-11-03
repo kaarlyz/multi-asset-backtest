@@ -275,3 +275,104 @@ def test_revenue_growth_calculation_reproducibility(real_duckdb):
     expected_growth = (119575000000.0 - 117154000000.0) / 117154000000.0
     assert abs(growth_data["growth_yoy"] - expected_growth) < 1e-9
     assert "0000320193-24-000006" in growth_data["source_accessions"]
+
+
+def test_as_of_2024_01_15_returns_fy2023_q4(real_duckdb):
+    """
+    Assert as of 2024-01-15 (after 10-K filed on 2023-11-03 but before Q1 FY24 filed on 2024-02-02),
+    calculate_quarterly_revenue_growth_yoy returns latest period_end == '2023-09-30' (Q4 FY2023).
+    """
+    reader = EquityPITReader(real_duckdb)
+    as_of = datetime(2024, 1, 15, 0, 0, tzinfo=timezone.utc)
+    cik = "0000320193"
+
+    res = calculate_quarterly_revenue_growth_yoy(reader, cik, as_of)
+    assert res is not None, "Expected growth calculation result for Apple as of 2024-01-15"
+    assert res["current_period_end"] == "2023-09-30"
+    assert res["current_val"] == 89498000000.0
+    assert res["prev_period_end"] == "2022-09-24"
+    assert res["prev_val"] == 90146000000.0
+
+    expected_growth = (89498000000.0 - 90146000000.0) / 90146000000.0
+    assert abs(res["growth_yoy"] - expected_growth) < 1e-6
+    assert abs(res["growth_yoy"] - (-0.007188)) < 1e-4
+
+    # Assert source_accessions contains both 10-K and 10-Q accession numbers
+    assert "0000320193-23-000106" in res["source_accessions"]
+    assert "0000320193-23-000077" in res["source_accessions"]
+
+    # Direct helper verification
+    derived_q4 = reader.get_derived_q4_fundamental(
+        cik, "RevenueFromContractWithCustomerExcludingAssessedTax", 2023, as_of
+    )
+    assert derived_q4 is not None
+    assert derived_q4["val"] == 89498000000.0
+    assert derived_q4["fiscal_period"] == "Q4"
+    assert derived_q4["is_derived"] is True
+    assert derived_q4["accession_number"] == "0000320193-23-000106+0000320193-23-000077"
+
+    pit_q4 = reader.get_as_of_fundamental(
+        cik, "RevenueFromContractWithCustomerExcludingAssessedTax", as_of, fiscal_period="Q4"
+    )
+    assert pit_q4 is not None
+    assert pit_q4["val"] == 89498000000.0
+    assert pit_q4["period_end"] == "2023-09-30"
+
+
+def test_temporal_boundary_before_and_after_10k_acceptance(real_duckdb):
+    """
+    Assert as of 2023-11-01 (before 10-K filed): latest available period is 2023-07-01 (Q3).
+    Assert as of 2023-11-05 (after 10-K filed): latest available period is 2023-09-30 (Q4 derived).
+    """
+    reader = EquityPITReader(real_duckdb)
+    cik = "0000320193"
+
+    # Before 10-K accepted: 2023-11-01 -> latest period is Q3 (2023-07-01)
+    as_of_before = datetime(2023, 11, 1, 0, 0, tzinfo=timezone.utc)
+    res_before = calculate_quarterly_revenue_growth_yoy(reader, cik, as_of_before)
+    assert res_before is not None
+    assert res_before["current_period_end"] == "2023-07-01"
+
+    # After 10-K accepted: 2023-11-05 -> latest period is Q4 derived (2023-09-30)
+    as_of_after = datetime(2023, 11, 5, 0, 0, tzinfo=timezone.utc)
+    res_after = calculate_quarterly_revenue_growth_yoy(reader, cik, as_of_after)
+    assert res_after is not None
+    assert res_after["current_period_end"] == "2023-09-30"
+
+
+def test_missing_9m_data_prevents_derivation(test_db):
+    """
+    If 9M data is missing for a fiscal year, Q4 standalone returns None,
+    does not impute zero or fabricate numbers.
+    """
+    reader = EquityPITReader(test_db)
+    cik = "0000320193"
+    concept = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    as_of = datetime(2024, 1, 15, 0, 0, tzinfo=timezone.utc)
+
+    # Insert only annual 10-K filing without cumulative 9M filing
+    test_db.insert_sec_fundamental_pit(
+        cik=cik,
+        entity_name="Apple Inc.",
+        concept=concept,
+        accession_number="0000320193-23-000106",
+        form="10-K",
+        filed_date="2023-11-03",
+        accepted_datetime=datetime(2023, 11, 3, 10, 0, tzinfo=timezone.utc),
+        period_start="2022-09-25",
+        period_end="2023-09-30",
+        fiscal_year=2023,
+        fiscal_period="FY",
+        val=383285000000.0,
+        unit="USD",
+    )
+
+    # Missing 9M prevents derivation -> must return None
+    derived = reader.get_derived_q4_fundamental(cik, concept, 2023, as_of)
+    assert derived is None, "Expected None when 9M filing is missing"
+
+    pit_q4 = reader.get_as_of_fundamental(cik, concept, as_of, fiscal_period="Q4")
+    assert pit_q4 is None, "Expected None when 9M filing is missing"
+
+    growth = calculate_quarterly_revenue_growth_yoy(reader, cik, as_of)
+    assert growth is None, "Expected None when 9M filing is missing"
