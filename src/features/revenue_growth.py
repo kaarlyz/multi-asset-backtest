@@ -1,0 +1,143 @@
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+from typing import Any, Dict, List, Optional, Union
+
+project_root = Path(__file__).resolve().parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from src.chronos.equity_pit import EquityPITReader
+
+PREFERRED_REVENUE_CONCEPTS = [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+]
+
+
+def calculate_quarterly_revenue_growth_yoy(
+    reader: EquityPITReader,
+    cik: str,
+    as_of_datetime: datetime,
+    concept: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Deterministically computes Year-over-Year (YoY) quarterly revenue growth strictly as of as_of_datetime.
+    - Queries latest available quarterly filing (form='10-Q' or '10-K' Q4).
+    - Finds matching quarter from previous fiscal year available as of as_of_datetime.
+    - Computes growth_yoy = (current_rev - prev_rev) / abs(prev_rev).
+    - If either period is missing or data unavailable, returns None (no zero imputation).
+    """
+    if as_of_datetime.tzinfo is None:
+        as_of_utc = as_of_datetime.replace(tzinfo=timezone.utc)
+    else:
+        as_of_utc = as_of_datetime.astimezone(timezone.utc)
+
+    concepts_to_try = [concept] if concept else PREFERRED_REVENUE_CONCEPTS
+
+    for test_concept in concepts_to_try:
+        res = _compute_yoy_for_concept(reader, cik, as_of_utc, test_concept)
+        if res is not None:
+            return res
+
+    return None
+
+
+def _compute_yoy_for_concept(
+    reader: EquityPITReader,
+    cik: str,
+    as_of_datetime: datetime,
+    concept: str,
+) -> Optional[Dict[str, Any]]:
+    history = reader.get_available_filings_history(cik, concept, as_of_datetime)
+    if not history:
+        return None
+
+    # Filter for quarterly facts (approx 3-month duration)
+    quarterly_records: List[Dict[str, Any]] = []
+    for h in history:
+        try:
+            d1 = datetime.strptime(str(h["period_start"]), "%Y-%m-%d")
+            d2 = datetime.strptime(str(h["period_end"]), "%Y-%m-%d")
+            duration_days = (d2 - d1).days
+        except (ValueError, TypeError):
+            continue
+
+        form = str(h.get("form", "")).upper()
+        fp = str(h.get("fiscal_period", "")).upper()
+
+        # 10-Q quarters are ~90 days (60-120 days)
+        # 10-K Q4 is also ~90 days
+        is_quarterly_duration = 60 <= duration_days <= 120
+        if is_quarterly_duration and (
+            form == "10-Q" or (form == "10-K" and fp in ("Q4", "FY", ""))
+        ):
+            quarterly_records.append(h)
+
+    if not quarterly_records:
+        return None
+
+    # Sort quarterly records by period_end ASC, then accepted_datetime ASC
+    quarterly_records.sort(
+        key=lambda x: (str(x["period_end"]), str(x["accepted_datetime"]))
+    )
+
+    # Latest quarterly filing available as of as_of_datetime
+    curr = quarterly_records[-1]
+    curr_val = float(curr["val"])
+    curr_end_str = str(curr["period_end"])
+    curr_end_dt = datetime.strptime(curr_end_str, "%Y-%m-%d")
+    curr_fy = int(curr.get("fiscal_year") or 0)
+    curr_fp = str(curr.get("fiscal_period", "")).upper()
+
+    # Find matching quarter from previous fiscal year
+    # Candidate must have period_end strictly prior to current period_end
+    # and either match (fiscal_year == curr_fy - 1 and fiscal_period == curr_fp)
+    # or period_end approx 1 year prior (340 to 390 days diff)
+    candidates: List[Dict[str, Any]] = []
+    for q in quarterly_records:
+        q_end_str = str(q["period_end"])
+        if q_end_str >= curr_end_str:
+            continue
+
+        q_end_dt = datetime.strptime(q_end_str, "%Y-%m-%d")
+        day_diff = (curr_end_dt - q_end_dt).days
+        q_fy = int(q.get("fiscal_year") or 0)
+        q_fp = str(q.get("fiscal_period", "")).upper()
+
+        matched = False
+        if curr_fp and q_fp and curr_fp == q_fp and curr_fy > 0 and q_fy == curr_fy - 1:
+            matched = True
+        elif 340 <= day_diff <= 390:
+            matched = True
+
+        if matched:
+            candidates.append(q)
+
+    if not candidates:
+        return None
+
+    # If multiple candidates exist for the prior quarter (e.g. restatements or amended filings),
+    # pick the latest by period_end then accepted_datetime
+    candidates.sort(
+        key=lambda x: (str(x["period_end"]), str(x["accepted_datetime"]))
+    )
+    prev = candidates[-1]
+    prev_val = float(prev["val"])
+
+    if prev_val == 0.0:
+        return None
+
+    growth_yoy = (curr_val - prev_val) / abs(prev_val)
+    accessions = sorted(list({curr["accession_number"], prev["accession_number"]}))
+
+    return {
+        "as_of_datetime": as_of_datetime,
+        "current_period_end": curr_end_str,
+        "current_val": curr_val,
+        "prev_period_end": str(prev["period_end"]),
+        "prev_val": prev_val,
+        "growth_yoy": growth_yoy,
+        "source_accessions": accessions,
+    }

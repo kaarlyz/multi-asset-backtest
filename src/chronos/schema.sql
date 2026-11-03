@@ -57,3 +57,24 @@ CREATE TABLE IF NOT EXISTS decision_ledger (
 CREATE INDEX IF NOT EXISTS idx_fundamentals_pit_avail ON fact_fundamentals_pit(asset_id, t_avail);
 CREATE INDEX IF NOT EXISTS idx_news_pit_avail ON fact_news_pit(t_avail);
 CREATE INDEX IF NOT EXISTS idx_decision_ledger_sim ON decision_ledger(sim_run_id, sim_time);
+
+CREATE TABLE IF NOT EXISTS fact_sec_fundamentals_pit (
+    cik VARCHAR NOT NULL,
+    entity_name VARCHAR NOT NULL,
+    concept VARCHAR NOT NULL,
+    accession_number VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    filed_date VARCHAR NOT NULL,
+    accepted_datetime TIMESTAMPTZ NOT NULL,
+    period_start VARCHAR NOT NULL,
+    period_end VARCHAR NOT NULL,
+    fiscal_year INTEGER NOT NULL,
+    fiscal_period VARCHAR NOT NULL,
+    val DOUBLE NOT NULL,
+    unit VARCHAR NOT NULL,
+    PRIMARY KEY (cik, concept, accession_number, period_end, form, period_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_pit_asof ON fact_sec_fundamentals_pit(cik, concept, accepted_datetime);
+CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_pit_period ON fact_sec_fundamentals_pit(cik, concept, period_end, accepted_datetime);
+

@@ -72,6 +72,80 @@ class ChronosDB:
             ],
         )
 
+    def insert_sec_fundamental_pit(
+        self,
+        cik: str,
+        entity_name: str,
+        concept: str,
+        accession_number: str,
+        form: str,
+        filed_date: str,
+        accepted_datetime: Union[datetime, str],
+        period_start: str,
+        period_end: str,
+        fiscal_year: int,
+        fiscal_period: str,
+        val: float,
+        unit: str,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO fact_sec_fundamentals_pit
+                (cik, entity_name, concept, accession_number, form, filed_date, accepted_datetime,
+                 period_start, period_end, fiscal_year, fiscal_period, val, unit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    str(cik).zfill(10),
+                    entity_name,
+                    concept,
+                    accession_number,
+                    form,
+                    str(filed_date),
+                    accepted_datetime,
+                    str(period_start or period_end or ""),
+                    str(period_end),
+                    int(fiscal_year),
+                    fiscal_period,
+                    float(val),
+                    unit,
+                ],
+            )
+
+    def insert_sec_fundamentals_batch(self, records: List[Dict[str, Any]]) -> int:
+        if not records:
+            return 0
+        rows = [
+            (
+                str(r["cik"]).zfill(10),
+                r["entity_name"],
+                r["concept"],
+                r["accession_number"],
+                r["form"],
+                str(r["filed_date"]),
+                r["accepted_datetime"],
+                str(r.get("period_start") or r.get("period_end") or ""),
+                str(r["period_end"]),
+                int(r["fiscal_year"]),
+                r["fiscal_period"],
+                float(r["val"]),
+                r["unit"],
+            )
+            for r in records
+        ]
+        with self._lock:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO fact_sec_fundamentals_pit
+                (cik, entity_name, concept, accession_number, form, filed_date, accepted_datetime,
+                 period_start, period_end, fiscal_year, fiscal_period, val, unit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
     def insert_news_pit(
         self,
         news_id: str,
