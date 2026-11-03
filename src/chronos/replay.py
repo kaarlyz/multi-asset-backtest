@@ -230,6 +230,65 @@ class HistoricalReplayEngine:
 
         return snapshot
 
+    def get_historical_bars(
+        self, limit: Optional[int] = None, sim_time: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get historical market bars strictly whose t_avail <= target_sim_time.
+        """
+        target_time = sim_time or self._current_sim_time
+        if target_time.tzinfo is None:
+            target_time = target_time.replace(tzinfo=timezone.utc)
+
+        if self.market_df.empty or "t_avail" not in self.market_df.columns:
+            return []
+
+        idx = int(self.market_df["t_avail"].searchsorted(pd.to_datetime(target_time), side="right"))  # type: ignore
+        if idx <= 0:
+            return []
+
+        sliced = self.market_df.iloc[:idx]
+        if limit is not None and limit > 0:
+            sliced = sliced.iloc[-limit:]
+
+        bars = sliced.to_dict(orient="records")
+        for b in bars:
+            avail = b.get("t_avail")
+            if avail is not None:
+                if isinstance(avail, pd.Timestamp):
+                    avail = avail.to_pydatetime()
+                if avail.tzinfo is None:
+                    avail = avail.replace(tzinfo=timezone.utc)
+                if avail > target_time:
+                    raise TemporalLeakageError(
+                        f"Market bar temporal leakage: t_avail ({avail}) > target_sim_time ({target_time})"
+                    )
+        return bars
+
+    def get_news(
+        self, lookback_days: Optional[int] = 7, sim_time: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get point-in-time news snapshot strictly adhering to t_avail <= sim_time.
+        """
+        target_time = sim_time or self._current_sim_time
+        if target_time.tzinfo is None:
+            target_time = target_time.replace(tzinfo=timezone.utc)
+
+        news = self.db.get_news_pit(self.symbol, target_time, lookback_days=lookback_days)
+        for item in news:
+            avail = item.get("t_avail")
+            if avail is not None:
+                if isinstance(avail, pd.Timestamp):
+                    avail = avail.to_pydatetime()
+                if avail.tzinfo is None:
+                    avail = avail.replace(tzinfo=timezone.utc)
+                if avail > target_time:
+                    raise TemporalLeakageError(
+                        f"News temporal leakage: t_avail ({avail}) > target_sim_time ({target_time})"
+                    )
+        return news
+
     @property
     def current_bar(self) -> Optional[Dict[str, Any]]:
         return self.get_current_bar()

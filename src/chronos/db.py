@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import duckdb
@@ -210,6 +210,82 @@ class ChronosDB:
         cols = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
         return [dict(zip(cols, row)) for row in rows]
+
+    def get_fundamentals_history(
+        self,
+        asset: str,
+        metric_id: str,
+        sim_time: datetime,
+        lookback_days: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        PIT fundamentals historical query: NEVER returns records where t_avail > sim_time.
+        Matches either asset_id or symbol in dim_assets.
+        """
+        if sim_time.tzinfo is None:
+            sim_time = sim_time.replace(tzinfo=timezone.utc)
+
+        query = """
+            WITH resolved_assets AS (
+                SELECT asset_id FROM dim_assets
+                WHERE asset_id = $1 OR symbol = $1
+                UNION
+                SELECT $1 AS asset_id
+            )
+            SELECT f.metric_id, f.asset_id, f.metric_value, f.t_event, f.t_pub, f.t_ingest, f.t_avail, f.source
+            FROM fact_fundamentals_pit f
+            JOIN resolved_assets ra ON f.asset_id = ra.asset_id
+            WHERE f.metric_id = $2 AND f.t_avail <= $3
+        """
+        params: List[Any] = [asset, metric_id, sim_time]
+        if lookback_days is not None:
+            lookback_time = sim_time - timedelta(days=lookback_days)
+            query += " AND f.t_avail >= $4"
+            params.append(lookback_time)
+
+        query += " ORDER BY f.t_avail ASC, f.t_event ASC"
+        cursor = self.conn.execute(query, params)
+        cols = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    def get_news_pit(
+        self,
+        symbol_or_asset: Optional[str] = None,
+        sim_time: Optional[datetime] = None,
+        lookback_days: Optional[int] = 7,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve news strictly adhering to t_avail <= sim_time.
+        Optionally filter by symbol/asset and lookback days.
+        """
+        if sim_time is None:
+            sim_time = datetime.now(timezone.utc)
+        elif sim_time.tzinfo is None:
+            sim_time = sim_time.replace(tzinfo=timezone.utc)
+
+        params: List[Any] = [sim_time]
+        query = "SELECT * FROM fact_news_pit WHERE t_avail <= ?"
+        if lookback_days is not None:
+            lookback_time = sim_time - timedelta(days=lookback_days)
+            query += " AND t_avail >= ?"
+            params.append(lookback_time)
+
+        query += " ORDER BY t_avail DESC"
+        cursor = self.conn.execute(query, params)
+        cols = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        news = [dict(zip(cols, row)) for row in rows]
+
+        if symbol_or_asset:
+            sym = symbol_or_asset.upper()
+            filtered = []
+            for item in news:
+                tags = [str(t).upper() for t in (item.get("tagged_symbols") or [])]
+                if not tags or sym in tags or any(sym in t or t in sym for t in tags):
+                    filtered.append(item)
+            return filtered
+        return news
 
     def close(self) -> None:
         if self.conn:
