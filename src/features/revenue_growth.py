@@ -34,14 +34,32 @@ def calculate_quarterly_revenue_growth_yoy(
     else:
         as_of_utc = as_of_datetime.astimezone(timezone.utc)
 
-    concepts_to_try = [concept] if concept else PREFERRED_REVENUE_CONCEPTS
+    if concept:
+        concepts_to_try = [concept]
+    else:
+        cik_zfill = str(cik).zfill(10)
+        from src.ingestion.sec_edgar import get_company_by_cik
+        comp = get_company_by_cik(cik_zfill)
+        if comp and "primary_concept" in comp:
+            primary = comp["primary_concept"]
+            concepts_to_try = [primary] + [c for c in PREFERRED_REVENUE_CONCEPTS if c != primary]
+        else:
+            concepts_to_try = PREFERRED_REVENUE_CONCEPTS
 
+    results = []
     for test_concept in concepts_to_try:
         res = _compute_yoy_for_concept(reader, cik, as_of_utc, test_concept)
         if res is not None:
-            return res
+            if concept is not None:
+                return res
+            results.append(res)
 
-    return None
+    if not results:
+        return None
+
+    # Pick result with the latest current_period_end
+    results.sort(key=lambda x: (str(x["current_period_end"]), str(x.get("as_of_datetime", ""))))
+    return results[-1]
 
 
 def _compute_yoy_for_concept(
@@ -82,7 +100,7 @@ def _compute_yoy_for_concept(
         if duration_days >= 330 and form == "10-K" and fp in ("FY", "Q4", "") and fy > 0:
             annual_10k_by_fy.setdefault(fy, []).append(h)
 
-        if 240 <= duration_days <= 300 and form == "10-Q" and fp == "Q3":
+        if 240 <= duration_days <= 305 and form == "10-Q" and fp == "Q3":
             nine_month_records.append(h)
 
     # Derive standalone Q4 records from 10-K and 10-Q Q3 9-month facts
@@ -98,19 +116,49 @@ def _compute_yoy_for_concept(
         if has_standalone:
             continue
 
-        matching_9m = [
-            m for m in nine_month_records
-            if str(m.get("period_start")) == str(ten_k["period_start"])
-            and m.get("unit") == ten_k.get("unit")
-            and m.get("cik") == ten_k.get("cik")
-            and m.get("concept") == ten_k.get("concept")
-        ]
-        if not matching_9m:
+        # Match 9M fact for this CIK:
+        # Handles 52/53-week calendar where period_start can shift by up to 7 days
+        candidate_9ms = []
+        tk_start_dt = None
+        try:
+            tk_start_dt = datetime.strptime(str(ten_k["period_start"]), "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+
+        for m in nine_month_records:
+            if (
+                m.get("unit") != ten_k.get("unit")
+                or str(m.get("cik")) != str(ten_k.get("cik"))
+                or m.get("concept") != ten_k.get("concept")
+            ):
+                continue
+            if str(m.get("period_end", "")) >= str(ten_k.get("period_end", "")):
+                continue
+
+            m_start_str = str(m.get("period_start", ""))
+            tk_start_str = str(ten_k.get("period_start", ""))
+            diff_days = 999
+            if m_start_str == tk_start_str:
+                diff_days = 0
+            elif tk_start_dt is not None:
+                try:
+                    m_start_dt = datetime.strptime(m_start_str, "%Y-%m-%d")
+                    diff_days = abs((m_start_dt - tk_start_dt).days)
+                except (ValueError, TypeError):
+                    diff_days = 999
+
+            if diff_days <= 7:
+                candidate_9ms.append((diff_days, m))
+
+        if not candidate_9ms:
             continue
+
+        candidate_9ms.sort(key=lambda x: x[0])
+        matching_9m = [x[1] for x in candidate_9ms]
 
         # Match the 9M filing specifically filed for that fiscal year:
         # e.g. for FY2022 10-K, prefer the 10-Q filed in fiscal year 2022 (e.g. 2022-07-29)
-        # over comparative comparative periods re-reported in FY2023 10-Q.
+        # over comparative periods re-reported in FY2023 10-Q.
         same_fy_9m = [
             m for m in matching_9m
             if int(m.get("fiscal_year") or 0) == int(ten_k.get("fiscal_year") or fy)
@@ -190,7 +238,7 @@ def _compute_yoy_for_concept(
         matched = False
         if curr_fp and q_fp and curr_fp == q_fp and curr_fy > 0 and q_fy == curr_fy - 1:
             matched = True
-        elif 340 <= day_diff <= 390:
+        elif 340 <= day_diff <= 395:
             matched = True
 
         if matched:

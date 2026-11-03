@@ -22,6 +22,48 @@ REVENUE_CONCEPTS = [
     "SalesRevenueNet",
 ]
 
+COMPANY_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "AAPL": {
+        "cik": "0000320193",
+        "name": "Apple Inc.",
+        "fiscal_year_end": "September",
+        "primary_concept": "RevenueFromContractWithCustomerExcludingAssessedTax",
+    },
+    "MSFT": {
+        "cik": "0000789019",
+        "name": "Microsoft Corp.",
+        "fiscal_year_end": "June",
+        "primary_concept": "RevenueFromContractWithCustomerExcludingAssessedTax",
+    },
+    "WMT": {
+        "cik": "0000104169",
+        "name": "Walmart Inc.",
+        "fiscal_year_end": "January",
+        "primary_concept": "RevenueFromContractWithCustomerExcludingAssessedTax",
+    },
+    "AMZN": {
+        "cik": "0001018724",
+        "name": "Amazon.com Inc.",
+        "fiscal_year_end": "December",
+        "primary_concept": "RevenueFromContractWithCustomerExcludingAssessedTax",
+    },
+    "NVDA": {
+        "cik": "0001045810",
+        "name": "NVIDIA Corp.",
+        "fiscal_year_end": "January",
+        "primary_concept": "Revenues",
+    },
+}
+
+
+def get_company_by_cik(cik: str) -> Optional[Dict[str, Any]]:
+    """Lookup company information from COMPANY_REGISTRY by CIK."""
+    cik_zfill = str(cik).zfill(10)
+    for sym, info in COMPANY_REGISTRY.items():
+        if info["cik"] == cik_zfill:
+            return {**info, "symbol": sym}
+    return None
+
 
 class SecEdgarIngestion:
     """Ingests raw XBRL company facts from SEC EDGAR API with cryptographic provenance."""
@@ -91,12 +133,64 @@ class SecEdgarIngestion:
         )
         return json_path, manifest_path
 
+    def fetch_submissions(
+        self, cik: str = "0000320193", force: bool = False
+    ) -> Tuple[Path, Path]:
+        """
+        Fetch submissions JSON metadata for given CIK from SEC EDGAR.
+        Saves raw JSON and SHA256 manifest.
+        """
+        cik_zfill = str(cik).zfill(10)
+        json_path = self.raw_data_dir / f"CIK{cik_zfill}_submissions.json"
+        manifest_path = self.raw_data_dir / f"CIK{cik_zfill}_submissions_manifest.json"
+
+        if json_path.exists() and manifest_path.exists() and not force:
+            logger.info("Using cached SEC EDGAR submissions: %s", json_path)
+            return json_path, manifest_path
+
+        url = f"https://data.sec.gov/submissions/CIK{cik_zfill}.json"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": SEC_USER_AGENT},
+        )
+
+        logger.info("Fetching SEC EDGAR submissions from %s", url)
+        retrieval_timestamp = datetime.now(timezone.utc).isoformat()
+        with urllib.request.urlopen(req) as resp:
+            raw_bytes = resp.read()
+
+        sha256_hash = hashlib.sha256(raw_bytes).hexdigest()
+        byte_size = len(raw_bytes)
+
+        with open(json_path, "wb") as f:
+            f.write(raw_bytes)
+
+        manifest_data = {
+            "cik": cik_zfill,
+            "source_url": url,
+            "retrieval_timestamp": retrieval_timestamp,
+            "byte_size": byte_size,
+            "sha256": sha256_hash,
+        }
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest_data, f, indent=2)
+
+        logger.info(
+            "Saved CIK%s submissions raw data (%d bytes, sha256: %s)",
+            cik_zfill,
+            byte_size,
+            sha256_hash[:12],
+        )
+        return json_path, manifest_path
+
     def parse_facts(
         self, raw_data_or_path: Union[str, Path, Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
         Parse XBRL companyfacts JSON into canonical fundamental records.
         Filters for specified revenue concepts.
+        Excludes segmented facts with dimensions.
+        Enforces deduplication on primary key.
         """
         if isinstance(raw_data_or_path, (str, Path)):
             with open(raw_data_or_path, "r", encoding="utf-8") as f:
@@ -109,6 +203,7 @@ class SecEdgarIngestion:
         us_gaap = data.get("facts", {}).get("us-gaap", {})
 
         records: List[Dict[str, Any]] = []
+        seen_keys = set()
 
         for concept in REVENUE_CONCEPTS:
             if concept not in us_gaap:
@@ -119,6 +214,15 @@ class SecEdgarIngestion:
 
             for unit, items in units.items():
                 for it in items:
+                    # Filter only consolidated facts (exclude segmented facts with dimensions)
+                    if (
+                        it.get("segment")
+                        or it.get("dimensions")
+                        or it.get("dimension")
+                        or it.get("segments")
+                    ):
+                        continue
+
                     accn = it.get("accn", "")
                     form = it.get("form", "")
                     filed_date = it.get("filed", "")
@@ -134,6 +238,12 @@ class SecEdgarIngestion:
                         continue
 
                     period_start = start if start else end
+
+                    # Primary key enforcement
+                    pk_key = (cik_val, concept, accn, end, form, period_start)
+                    if pk_key in seen_keys:
+                        continue
+                    seen_keys.add(pk_key)
 
                     # Accepted datetime: extract from item, look up in submissions cache, or fallback to filed date
                     accepted_dt = (
@@ -152,10 +262,16 @@ class SecEdgarIngestion:
                                     with open(sub_file, "r", encoding="utf-8") as sf:
                                         s_data = json.load(sf)
                                     rec_sub = s_data.get("filings", {}).get("recent", {})
-                                    self._acc_cache[cik_val] = dict(zip(rec_sub.get("accessionNumber", []), rec_sub.get("acceptanceDateTime", [])))
+                                    acc_nums = rec_sub.get("accessionNumber", [])
+                                    acc_dts = rec_sub.get("acceptanceDateTime", [])
+                                    cache_map = {}
+                                    for a_num, a_dt in zip(acc_nums, acc_dts):
+                                        cache_map[a_num] = a_dt
+                                        cache_map[a_num.replace("-", "")] = a_dt
+                                    self._acc_cache[cik_val] = cache_map
                                 except Exception:
                                     self._acc_cache[cik_val] = {}
-                            accepted_dt = self._acc_cache[cik_val].get(accn)
+                            accepted_dt = self._acc_cache[cik_val].get(accn) or self._acc_cache[cik_val].get(accn.replace("-", ""))
 
                     if not accepted_dt:
                         accepted_dt = f"{filed_date}T00:00:00Z"
@@ -188,8 +304,16 @@ class SecEdgarIngestion:
     def ingest(
         self, cik: str = "0000320193", force_fetch: bool = False
     ) -> List[Dict[str, Any]]:
-        """Run raw fetch, parse canonical facts, and store into database."""
-        json_path, _ = self.fetch_raw(cik=cik, force=force_fetch)
+        """Run raw fetch for facts and submissions, parse canonical facts, and store into database."""
+        cik_zfill = str(cik).zfill(10)
+        sub_file = self.raw_data_dir / f"CIK{cik_zfill}_submissions.json"
+        if force_fetch or not sub_file.exists():
+            try:
+                self.fetch_submissions(cik=cik_zfill, force=force_fetch)
+            except Exception as e:
+                logger.warning("Could not fetch submissions for CIK%s: %s", cik_zfill, e)
+
+        json_path, _ = self.fetch_raw(cik=cik_zfill, force=force_fetch)
         records = self.parse_facts(json_path)
 
         if self.db is not None:
@@ -198,11 +322,22 @@ class SecEdgarIngestion:
 
         return records
 
+    def ingest_all(self, force_fetch: bool = False) -> Dict[str, int]:
+        """Run batch ingestion across all registered companies in COMPANY_REGISTRY."""
+        results = {}
+        for sym, info in COMPANY_REGISTRY.items():
+            cik = info["cik"]
+            logger.info("Ingesting %s (CIK %s)...", sym, cik)
+            records = self.ingest(cik=cik, force_fetch=force_fetch)
+            results[sym] = len(records)
+        return results
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     db_path = Path(__file__).resolve().parent.parent.parent / "data" / "chronos.duckdb"
     db = ChronosDB(str(db_path))
     ingestion = SecEdgarIngestion(db=db)
-    records = ingestion.ingest(cik="0000320193", force_fetch=True)
-    print(f"Successfully ingested {len(records)} records for Apple Inc.")
+    batch_results = ingestion.ingest_all(force_fetch=False)
+    for sym, count in batch_results.items():
+        print(f"Successfully ingested {count} records for {sym} ({COMPANY_REGISTRY[sym]['name']})")

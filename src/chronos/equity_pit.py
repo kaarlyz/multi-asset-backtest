@@ -112,7 +112,7 @@ class EquityPITReader:
 
             if form == "10-K" and fp in ("FY", "Q4", "") and dur >= 330 and fy == fiscal_year:
                 annual_10ks.append(h)
-            elif form == "10-Q" and fp == "Q3" and 240 <= dur <= 300:
+            elif form == "10-Q" and fp == "Q3" and 240 <= dur <= 305:
                 nine_ms.append(h)
 
         if not annual_10ks:
@@ -122,14 +122,42 @@ class EquityPITReader:
         annual_10ks.sort(key=lambda x: (str(x["period_end"]), str(x["accepted_datetime"])))
         ten_k = annual_10ks[-1]
 
-        matching_9m = [
-            m for m in nine_ms
-            if str(m.get("period_start")) == str(ten_k["period_start"])
-            and m.get("unit") == ten_k.get("unit")
-            and m.get("cik") == ten_k.get("cik")
-        ]
-        if not matching_9m:
+        # Match 9M fact for this CIK:
+        # Handles 52/53-week calendar where period_start can shift by up to 7 days
+        candidate_9ms = []
+        tk_start_dt = None
+        try:
+            tk_start_dt = datetime.strptime(str(ten_k["period_start"]), "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+
+        for m in nine_ms:
+            if m.get("unit") != ten_k.get("unit") or str(m.get("cik")) != str(ten_k.get("cik")):
+                continue
+            if str(m.get("period_end", "")) >= str(ten_k.get("period_end", "")):
+                continue
+
+            m_start_str = str(m.get("period_start", ""))
+            tk_start_str = str(ten_k.get("period_start", ""))
+            diff_days = 999
+            if m_start_str == tk_start_str:
+                diff_days = 0
+            elif tk_start_dt is not None:
+                try:
+                    m_start_dt = datetime.strptime(m_start_str, "%Y-%m-%d")
+                    diff_days = abs((m_start_dt - tk_start_dt).days)
+                except (ValueError, TypeError):
+                    diff_days = 999
+
+            if diff_days <= 7:
+                candidate_9ms.append((diff_days, m))
+
+        if not candidate_9ms:
             return None
+
+        # Prefer smallest start-date shift (diff_days), then match fiscal year or filing year
+        candidate_9ms.sort(key=lambda x: x[0])
+        matching_9m = [x[1] for x in candidate_9ms]
 
         same_fy_9m = [
             m for m in matching_9m
