@@ -60,10 +60,11 @@ def parse_args():
         default=10000.0,
         help="Initial simulated cash (default: 10,000 USDT).",
     )
+    default_db = str(project_root / "data" / "chronos.duckdb")
     parser.add_argument(
         "--db-path",
-        default=":memory:",
-        help="DuckDB database path (default: :memory:).",
+        default=default_db,
+        help=f"DuckDB database path (default: {default_db}).",
     )
     return parser.parse_args()
 

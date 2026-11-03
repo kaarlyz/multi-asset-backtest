@@ -48,6 +48,25 @@ class SimulationRunner:
 
         # In both modes, SimulationRunner orchestrates execution and prompts
         self.orchestrator.telegram_service = None
+        self.orchestrator.portfolio = self.portfolio
+
+    def _get_position(self, symbol: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Retrieve active position matching symbol from portfolio."""
+        if not symbol or not self.portfolio or not hasattr(self.portfolio, "open_positions"):
+            return None
+        positions = self.portfolio.open_positions
+        if not positions:
+            return None
+        if symbol in positions:
+            return positions[symbol]
+        clean = symbol.replace("CRYPTO_", "").replace("USDT", "")
+        for sym, pos in positions.items():
+            sym_clean = sym.replace("CRYPTO_", "").replace("USDT", "")
+            if sym_clean == clean:
+                return pos
+        if len(positions) == 1:
+            return next(iter(positions.values()))
+        return None
 
     def start_command_listener(self) -> None:
         """Start background daemon thread for Telegram command polling."""
@@ -99,9 +118,15 @@ class SimulationRunner:
         bar = state.get("bar") or self.replay_engine.get_current_bar()
 
         # 3. Update portfolio mark-to-market and check SL/TP triggers
-        closed_in_bar = []
-        if bar:
+        closed_in_bar = step_out.get("closed_trades", [])
+        if not closed_in_bar and bar:
             closed_in_bar = self.portfolio.update_bar(bar)
+
+        # Notify trade exits (SL / TP / exit) via Telegram
+        if self.telegram_service is not None and closed_in_bar:
+            for tr in closed_in_bar:
+                if hasattr(self.telegram_service, "send_exit_notification"):
+                    self.telegram_service.send_exit_notification(tr)
 
         audit_verdict = step_out.get("audit_verdict")
         decision_report = step_out.get("decision_report")
@@ -112,10 +137,34 @@ class SimulationRunner:
         decision_id = decision_report.decision_id if decision_report else None
         is_approved = bool(audit_verdict and audit_verdict.status == "APPROVED")
 
+        # Position-aware signal suppression check
+        asset_id = self.replay_engine.active_asset
+        symbol = bar.get("symbol") if bar else asset_id
+        pos = self._get_position(symbol) or self._get_position(asset_id)
+        current_side = pos.get("side") if pos else None
+
+        is_hold = step_out.get("is_hold", False)
+        if not is_hold and is_approved and proposed_action in ("BUY", "SHORT"):
+            if current_side == "LONG" and proposed_action == "BUY":
+                is_hold = True
+            elif current_side == "SHORT" and proposed_action == "SHORT":
+                is_hold = True
+
         executed_action = None
 
+        if is_hold:
+            executed_action = "HOLD"
+            if self.replay_engine.db and decision_id:
+                self.replay_engine.db.update_decision(
+                    decision_id=decision_id,
+                    action="HOLD",
+                    actor_id=f"{self.mode}_RUNNER",
+                    interface="AUTONOMOUS_LEDGER",
+                    status="HOLD",
+                )
+
         # 4. Mode AUTONOMOUS
-        if self.mode == "AUTONOMOUS":
+        elif self.mode == "AUTONOMOUS":
             if is_approved and proposed_action in ("BUY", "SHORT") and bar and decision_id:
                 self.portfolio.execute_decision(
                     action=proposed_action,

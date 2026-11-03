@@ -1,13 +1,14 @@
 from datetime import datetime, timedelta, timezone
 import threading
 import time
+from typing import Any, Dict
 import httpx
 import pandas as pd
 import pytest
 
 from src.agents.quant_specialist import QuantSpecialist
 from src.agents.news_miner import NewsMiner
-from src.agents.synthesizer import Synthesizer
+from src.agents.synthesizer import Synthesizer, DecisionReport
 from src.agents.risk_auditor import RiskAuditor
 from src.bot.telegram_service import TelegramBotService
 from src.chronos.db import ChronosDB
@@ -408,3 +409,229 @@ def test_interactive_mode_waiting_and_callback(test_db, mock_http_client):
 
     # Verify Telegram prompt was dispatched via mock client
     assert len(mock_http_client.mock_calls) > 0
+
+
+def test_position_aware_signal_suppression(test_db, mock_http_client):
+    """
+    Verify position-aware filtering:
+    1. FLAT portfolio -> BUY signal dispatches prompt and executes order.
+    2. Holding LONG -> consecutive BUY signal suppresses prompt, logs as HOLD, does not pause clock or duplicate order.
+    3. Holding LONG -> REVERSAL SHORT signal dispatches prompt and executes reversal (closes LONG, opens SHORT).
+    4. Holding SHORT -> consecutive SHORT signal suppresses prompt, logs as HOLD.
+    """
+    sim_start = datetime(2024, 8, 1, 12, 0, tzinfo=timezone.utc)
+    auth_user_id = 6526833205
+
+    # Fundamentals: bullish TVL
+    t_fund = sim_start - timedelta(days=2)
+    test_db.insert_fundamental_pit(
+        metric_id="TVL",
+        asset_id="CRYPTO_BTC",
+        metric_value=300_000_000.0,
+        t_event=t_fund,
+        t_pub=t_fund,
+        t_ingest=t_fund + timedelta(minutes=5),
+        t_avail=t_fund + timedelta(minutes=5),
+        source="defillama",
+    )
+
+    # Bullish news
+    t_news = sim_start - timedelta(hours=3)
+    test_db.insert_news_pit(
+        news_id="NEWS_POS_AWARE_01",
+        title="Bullish Momentum Persistent",
+        source="bloomberg",
+        url="https://bloomberg.com/btc",
+        raw_content="Sustained buying momentum detected.",
+        sentiment_score=0.90,
+        tagged_symbols=["BTCUSDT", "BTC"],
+        t_event=t_news,
+        t_pub=t_news,
+        t_ingest=t_news + timedelta(seconds=10),
+        t_avail=t_news + timedelta(seconds=10),
+    )
+
+    # Create 40 market bars (30 warm-up + 10 simulation)
+    bars = []
+    base_price = 50000.0
+    for i in range(40):
+        t_bar = sim_start - timedelta(hours=30 - i)
+        close_p = base_price + (i * 100.0)
+        bars.append({
+            "open_time": int(t_bar.timestamp() * 1000),
+            "open": close_p - 50.0,
+            "high": close_p + 100.0,
+            "low": close_p - 50.0,
+            "close": close_p,
+            "volume": 25.0,
+            "quote_volume": 25.0 * close_p,
+            "t_event": t_bar,
+            "t_pub": t_bar + timedelta(minutes=59),
+            "t_avail": t_bar + timedelta(hours=1),
+            "t_ingest": t_bar + timedelta(hours=1, seconds=2),
+            "symbol": "BTCUSDT",
+            "interval": "1h",
+        })
+    market_df = pd.DataFrame(bars)
+
+    replay_engine = HistoricalReplayEngine(
+        db=test_db,
+        symbol="BTCUSDT",
+        start_time=sim_start,
+        end_time=sim_start + timedelta(hours=8),
+        step_size="1h",
+        interval="1h",
+        market_data=market_df,
+    )
+
+    telegram_service = TelegramBotService(
+        token="MOCK_TEST_TOKEN",
+        allowed_user_ids=[auth_user_id],
+        replay_engine=replay_engine,
+        db=test_db,
+        http_client=mock_http_client,
+    )
+
+    orchestrator = MultiAgentOrchestrator(
+        replay_engine=replay_engine,
+        db=test_db,
+    )
+
+    portfolio = SimPortfolio(initial_cash=10000.0)
+
+    runner = SimulationRunner(
+        replay_engine=replay_engine,
+        orchestrator=orchestrator,
+        portfolio=portfolio,
+        telegram_service=telegram_service,
+        mode="INTERACTIVE",
+        decision_timeout=2.0,
+        poll_interval=0.02,
+    )
+
+    # --- STEP 1: FLAT portfolio receives BUY signal -> Prompt dispatched, order executed ---
+    def respond_buy():
+        time.sleep(0.05)
+        pending = None
+        for _ in range(50):
+            with test_db._lock:
+                records = test_db.conn.execute("SELECT decision_id FROM decision_ledger WHERE action = 'BUY'").fetchall()
+            if records:
+                pending = records[-1][0]
+                break
+            time.sleep(0.02)
+        if pending:
+            telegram_service.handle_callback({
+                "id": "query_step1_buy",
+                "from": {"id": auth_user_id},
+                "data": f"DECIDE:{pending}:BUY",
+            })
+
+    t1 = threading.Thread(target=respond_buy, daemon=True)
+    t1.start()
+
+    res1 = runner.step()
+    t1.join(timeout=2.0)
+
+    assert res1["executed_action"] == "BUY"
+    assert "BTCUSDT" in portfolio.open_positions
+    assert portfolio.open_positions["BTCUSDT"]["side"] == "LONG"
+    orig_pos_size = portfolio.open_positions["BTCUSDT"]["size"]
+    prompt_count_after_step1 = len(mock_http_client.mock_calls)
+    assert prompt_count_after_step1 > 0
+    assert runner.replay_engine.is_paused is False
+
+    # --- STEP 2: Consecutive BUY signal while holding LONG -> Suppressed as HOLD ---
+    # No mock responder thread needed because runner should NOT pause or prompt
+    res2 = runner.step()
+
+    assert res2["executed_action"] == "HOLD"
+    # Telegram calls must not increase (prompt suppressed)
+    assert len(mock_http_client.mock_calls) == prompt_count_after_step1
+    # Clock must not be paused
+    assert runner.replay_engine.is_paused is False
+    # No duplicate order executed (size remains identical)
+    assert len(portfolio.open_positions) == 1
+    assert portfolio.open_positions["BTCUSDT"]["size"] == orig_pos_size
+    # Decision ledger should reflect HOLD
+    dec2_id = res2["step_output"]["decision_report"].decision_id
+    rec2 = test_db.get_decision(dec2_id)
+    assert rec2 is not None
+    assert rec2["action"] == "HOLD"
+    assert rec2["status"] == "HOLD"
+
+    # --- STEP 3: Another consecutive BUY signal -> Also suppressed as HOLD ---
+    res3 = runner.step()
+    assert res3["executed_action"] == "HOLD"
+    assert len(mock_http_client.mock_calls) == prompt_count_after_step1
+    assert portfolio.open_positions["BTCUSDT"]["size"] == orig_pos_size
+
+    # --- STEP 4: REVERSAL signal (Holding LONG, Synthesizer proposes SHORT) ---
+    class MockReversalSynthesizer(Synthesizer):
+        def evaluate(self, context: Dict[str, Any]) -> DecisionReport:
+            sim_time = context.get("sim_time") or datetime.now(timezone.utc)
+            asset_id = context.get("asset_id") or "BTCUSDT"
+            quant = context.get("quant_analysis")
+            news = context.get("news_analysis")
+            return DecisionReport(
+                decision_id=f"DEC_REV_SHORT_{int(time.time()*1000)}",
+                asset_id=asset_id,
+                sim_time=sim_time,
+                proposed_action="SHORT",
+                confidence=0.92,
+                quant_analysis=quant,  # type: ignore
+                news_analysis=news,  # type: ignore
+                supporting_evidence=["Bearish divergence confirmed"],
+                contradicting_evidence=[],
+            )
+
+    orchestrator.synthesizer = MockReversalSynthesizer()
+
+    def respond_short():
+        time.sleep(0.05)
+        pending = None
+        for _ in range(50):
+            with test_db._lock:
+                records = test_db.conn.execute("SELECT decision_id FROM decision_ledger WHERE action = 'SHORT'").fetchall()
+            if records:
+                pending = records[-1][0]
+                break
+            time.sleep(0.02)
+        if pending:
+            telegram_service.handle_callback({
+                "id": "query_step4_short",
+                "from": {"id": auth_user_id},
+                "data": f"DECIDE:{pending}:SHORT",
+            })
+
+    t4 = threading.Thread(target=respond_short, daemon=True)
+    t4.start()
+
+    res4 = runner.step()
+    t4.join(timeout=2.0)
+
+    # Prompt MUST be dispatched for REVERSAL
+    assert len(mock_http_client.mock_calls) > prompt_count_after_step1
+    prompt_count_after_step4 = len(mock_http_client.mock_calls)
+    assert res4["executed_action"] == "SHORT"
+    assert portfolio.open_positions["BTCUSDT"]["side"] == "SHORT"
+    short_pos_size = portfolio.open_positions["BTCUSDT"]["size"]
+    # Previous LONG position closed
+    assert len(portfolio.closed_trades) == 1
+    assert portfolio.closed_trades[0]["side"] == "LONG"
+    assert portfolio.closed_trades[0]["exit_reason"] == "SIGNAL"
+
+    # --- STEP 5: Consecutive SHORT signal while holding SHORT -> Suppressed as HOLD ---
+    res5 = runner.step()
+    assert res5["executed_action"] == "HOLD"
+    # Prompt suppressed: Telegram prompt calls did not increase (excluding potential exit notifications)
+    # Replay clock not paused
+    assert runner.replay_engine.is_paused is False
+    assert portfolio.open_positions["BTCUSDT"]["side"] == "SHORT"
+    assert portfolio.open_positions["BTCUSDT"]["size"] == short_pos_size
+    dec5_id = res5["step_output"]["decision_report"].decision_id
+    rec5 = test_db.get_decision(dec5_id)
+    assert rec5 is not None
+    assert rec5["action"] == "HOLD"
+    assert rec5["status"] == "HOLD"
+

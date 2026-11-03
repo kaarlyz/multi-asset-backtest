@@ -318,6 +318,35 @@ class TelegramBotService:
             "response": resp,
         }
 
+    def send_exit_notification(
+        self,
+        trade: Dict[str, Any],
+        chat_id: Optional[Union[int, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Send notification when a position is closed (SL, TP, or signal exit).
+        """
+        target_chat = chat_id or (list(self.allowed_user_ids)[0] if self.allowed_user_ids else None)
+        if target_chat is None:
+            return None
+
+        sym = trade.get("symbol", "ASSET")
+        side = trade.get("side", "")
+        reason = trade.get("exit_reason", "EXIT")
+        entry_p = float(trade.get("entry_price", 0.0))
+        exit_p = float(trade.get("exit_price", 0.0))
+        pnl = float(trade.get("realized_pnl", 0.0))
+        ret = float(trade.get("return_pct", 0.0))
+        emoji = "🟢" if pnl >= 0 else "🔴"
+
+        text = (
+            f"🔔 *POSITION CLOSED ({reason}): {sym}*\n"
+            f"Side: {side}\n"
+            f"Entry: ${entry_p:,.2f} | Exit: ${exit_p:,.2f}\n"
+            f"Realized PnL: {emoji} ${pnl:+,.2f} ({ret:+.2f}%)"
+        )
+        return self.send_message(chat_id=target_chat, text=text)
+
     def handle_callback(self, callback_query: Dict[str, Any]) -> Dict[str, Any]:
         """
         Validate user allowlist, enforce idempotency against decision_ledger,

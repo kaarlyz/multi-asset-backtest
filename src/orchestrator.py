@@ -32,16 +32,36 @@ class MultiAgentOrchestrator:
         telegram_service: Optional[TelegramBotService] = None,
         db: Optional[ChronosDB] = None,
         actor_id: str = "MULTI_AGENT_ENGINE",
+        portfolio: Optional[Any] = None,
     ):
         self.replay_engine = replay_engine
         self.db = db or replay_engine.db
         self.telegram_service = telegram_service
         self.actor_id = actor_id
+        self.portfolio = portfolio
 
         self.quant_agent = quant_agent or QuantSpecialist()
         self.news_miner = news_miner or NewsMiner()
         self.synthesizer = synthesizer or Synthesizer()
         self.risk_auditor = risk_auditor or RiskAuditor()
+
+    def _get_position(self, symbol: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Retrieve active position matching symbol from portfolio if available."""
+        if not symbol or not self.portfolio or not hasattr(self.portfolio, "open_positions"):
+            return None
+        positions = self.portfolio.open_positions
+        if not positions:
+            return None
+        if symbol in positions:
+            return positions[symbol]
+        clean = symbol.replace("CRYPTO_", "").replace("USDT", "")
+        for sym, pos in positions.items():
+            sym_clean = sym.replace("CRYPTO_", "").replace("USDT", "")
+            if sym_clean == clean:
+                return pos
+        if len(positions) == 1:
+            return next(iter(positions.values()))
+        return None
 
     def step(self, advance: bool = True) -> Dict[str, Any]:
         """
@@ -56,6 +76,15 @@ class MultiAgentOrchestrator:
         asset_id = self.replay_engine.active_asset
         sim_run_id = self.replay_engine.sim_run_id
         current_bar = state.get("bar") or {}
+
+        # Update portfolio if attached and current_bar exists
+        closed_trades = []
+        if self.portfolio is not None and current_bar:
+            closed_trades = self.portfolio.update_bar(current_bar)
+            if self.telegram_service is not None and closed_trades:
+                for tr in closed_trades:
+                    if hasattr(self.telegram_service, "send_exit_notification"):
+                        self.telegram_service.send_exit_notification(tr)
 
         # Build execution context strictly at current_sim_time
         context: Dict[str, Any] = {
@@ -101,41 +130,70 @@ class MultiAgentOrchestrator:
             "audit_details": audit_verdict.audit_details,
         }
 
+        is_hold = False
         if audit_verdict.status == "APPROVED":
             if decision_report.proposed_action in ("BUY", "SHORT"):
-                # Dispatch signal via Telegram Bot if available
-                if self.telegram_service is not None and entry_price is not None:
-                    summary = (
-                        f"{decision_report.proposed_action} signal (conf: {decision_report.confidence:.2f}). "
-                        f"Quant: {quant_result.score:+.2f}, News: {news_result.score:+.2f}"
-                    )
-                    self.telegram_service.send_signal_prompt(
-                        asset=asset_id,
-                        current_price=entry_price,
-                        report_summary=summary,
-                        decision_id=decision_id,
-                    )
-                    dispatched = True
-                    interface = "TELEGRAM_PROMPT"
-                    status = "SIGNAL_DISPATCHED"
-                else:
-                    interface = "AUTONOMOUS_LEDGER"
-                    status = "APPROVED"
+                # Check position-aware filtering
+                if self.portfolio is not None:
+                    pos = self._get_position(asset_id) or (self._get_position(current_bar.get("symbol")) if current_bar else None)
+                    if pos:
+                        cur_side = pos.get("side")
+                        if cur_side == "LONG" and decision_report.proposed_action == "BUY":
+                            is_hold = True
+                        elif cur_side == "SHORT" and decision_report.proposed_action == "SHORT":
+                            is_hold = True
 
-                if self.db is not None:
-                    self.db.record_decision(
-                        decision_id=decision_id,
-                        sim_run_id=sim_run_id,
-                        sim_time=sim_time,
-                        asset_id=asset_id,
-                        interface=interface,
-                        actor_id=self.actor_id,
-                        action=decision_report.proposed_action,
-                        agent_confidence=decision_report.confidence,
-                        evidence_snapshot=evidence_payload,
-                        entry_price=entry_price,
-                        status=status,
-                    )
+                if is_hold:
+                    # Suppress prompt, log as HOLD
+                    dispatched = False
+                    if self.db is not None:
+                        self.db.record_decision(
+                            decision_id=decision_id,
+                            sim_run_id=sim_run_id,
+                            sim_time=sim_time,
+                            asset_id=asset_id,
+                            interface="AUTONOMOUS_LEDGER",
+                            actor_id=self.actor_id,
+                            action="HOLD",
+                            agent_confidence=decision_report.confidence,
+                            evidence_snapshot=evidence_payload,
+                            entry_price=entry_price,
+                            status="HOLD",
+                        )
+                else:
+                    # Dispatch signal via Telegram Bot if available
+                    if self.telegram_service is not None and entry_price is not None:
+                        summary = (
+                            f"{decision_report.proposed_action} signal (conf: {decision_report.confidence:.2f}). "
+                            f"Quant: {quant_result.score:+.2f}, News: {news_result.score:+.2f}"
+                        )
+                        self.telegram_service.send_signal_prompt(
+                            asset=asset_id,
+                            current_price=entry_price,
+                            report_summary=summary,
+                            decision_id=decision_id,
+                        )
+                        dispatched = True
+                        interface = "TELEGRAM_PROMPT"
+                        status = "SIGNAL_DISPATCHED"
+                    else:
+                        interface = "AUTONOMOUS_LEDGER"
+                        status = "APPROVED"
+
+                    if self.db is not None:
+                        self.db.record_decision(
+                            decision_id=decision_id,
+                            sim_run_id=sim_run_id,
+                            sim_time=sim_time,
+                            asset_id=asset_id,
+                            interface=interface,
+                            actor_id=self.actor_id,
+                            action=decision_report.proposed_action,
+                            agent_confidence=decision_report.confidence,
+                            evidence_snapshot=evidence_payload,
+                            entry_price=entry_price,
+                            status=status,
+                        )
             else:
                 # Proposed action is IGNORE
                 if self.db is not None:
@@ -178,7 +236,9 @@ class MultiAgentOrchestrator:
             "decision_report": decision_report,
             "audit_verdict": audit_verdict,
             "dispatched": dispatched,
-            "status": audit_verdict.status,
+            "status": "HOLD" if is_hold else audit_verdict.status,
+            "is_hold": is_hold,
+            "closed_trades": closed_trades,
         }
 
     def run(self, max_steps: Optional[int] = None) -> List[Dict[str, Any]]:
