@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 *.duckdb
 *.duckdb.wal
+.env
+.env.*
+!.env.example
 data/parquet/*
 !data/parquet/market/
 !data/parquet/fundamentals/

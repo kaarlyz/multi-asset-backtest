@@ -51,7 +51,7 @@ class ChronosDB:
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO fact_fundamentals_pit
+            INSERT OR REPLACE INTO fact_fundamentals_pit
             (metric_id, asset_id, metric_value, t_event, t_pub, t_ingest, t_avail, source, provenance_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -152,6 +152,26 @@ class ChronosDB:
                 status,
             ],
         )
+
+    def has_decision(self, decision_id: str) -> bool:
+        """Check if decision_id already exists in decision_ledger (for idempotency checks)."""
+        row = self.conn.execute(
+            "SELECT count(*) FROM decision_ledger WHERE decision_id = ?",
+            [decision_id],
+        ).fetchone()
+        return bool(row and row[0] > 0)
+
+    def get_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a recorded decision by decision_id."""
+        cursor = self.conn.execute(
+            "SELECT * FROM decision_ledger WHERE decision_id = ?",
+            [decision_id],
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cols = [desc[0] for desc in cursor.description]
+        return dict(zip(cols, row))
 
     def get_crypto_snapshot(
         self,
