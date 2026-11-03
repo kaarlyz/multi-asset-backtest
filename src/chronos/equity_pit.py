@@ -131,8 +131,17 @@ class EquityPITReader:
         if not matching_9m:
             return None
 
-        matching_9m.sort(key=lambda x: str(x["accepted_datetime"]))
-        nine_m = matching_9m[-1]
+        same_fy_9m = [
+            m for m in matching_9m
+            if int(m.get("fiscal_year") or 0) == fiscal_year
+            or str(m.get("filed_date", ""))[:4] == str(ten_k.get("filed_date", ""))[:4]
+        ]
+        if same_fy_9m:
+            same_fy_9m.sort(key=lambda x: str(x.get("filed_date", "")))
+            nine_m = same_fy_9m[0]
+        else:
+            matching_9m.sort(key=lambda x: str(x.get("filed_date", "")))
+            nine_m = matching_9m[0]
 
         q4_val = float(ten_k["val"]) - float(nine_m["val"])
         d_q3_end = datetime.strptime(str(nine_m["period_end"]), "%Y-%m-%d")

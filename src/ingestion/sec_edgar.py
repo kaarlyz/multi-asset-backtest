@@ -135,12 +135,28 @@ class SecEdgarIngestion:
 
                     period_start = start if start else end
 
-                    # Accepted datetime: extract from item or construct ISO8601 UTC from filed date
+                    # Accepted datetime: extract from item, look up in submissions cache, or fallback to filed date
                     accepted_dt = (
                         it.get("accepted_datetime")
                         or it.get("accepted")
                         or it.get("acceptanceDateTime")
                     )
+                    if not accepted_dt and accn:
+                        # Attempt to resolve exact acceptanceDateTime from submissions cache
+                        sub_file = self.raw_data_dir / f"CIK{cik_val}_submissions.json"
+                        if sub_file.exists():
+                            if not hasattr(self, "_acc_cache"):
+                                self._acc_cache = {}
+                            if cik_val not in self._acc_cache:
+                                try:
+                                    with open(sub_file, "r", encoding="utf-8") as sf:
+                                        s_data = json.load(sf)
+                                    rec_sub = s_data.get("filings", {}).get("recent", {})
+                                    self._acc_cache[cik_val] = dict(zip(rec_sub.get("accessionNumber", []), rec_sub.get("acceptanceDateTime", [])))
+                                except Exception:
+                                    self._acc_cache[cik_val] = {}
+                            accepted_dt = self._acc_cache[cik_val].get(accn)
+
                     if not accepted_dt:
                         accepted_dt = f"{filed_date}T00:00:00Z"
 

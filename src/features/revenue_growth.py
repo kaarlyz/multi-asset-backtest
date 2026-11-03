@@ -108,8 +108,20 @@ def _compute_yoy_for_concept(
         if not matching_9m:
             continue
 
-        matching_9m.sort(key=lambda x: str(x["accepted_datetime"]))
-        q3_9m = matching_9m[-1]
+        # Match the 9M filing specifically filed for that fiscal year:
+        # e.g. for FY2022 10-K, prefer the 10-Q filed in fiscal year 2022 (e.g. 2022-07-29)
+        # over comparative comparative periods re-reported in FY2023 10-Q.
+        same_fy_9m = [
+            m for m in matching_9m
+            if int(m.get("fiscal_year") or 0) == int(ten_k.get("fiscal_year") or fy)
+            or str(m.get("filed_date", ""))[:4] == str(ten_k.get("filed_date", ""))[:4]
+        ]
+        if same_fy_9m:
+            same_fy_9m.sort(key=lambda x: str(x.get("filed_date", "")))
+            q3_9m = same_fy_9m[0]
+        else:
+            matching_9m.sort(key=lambda x: str(x.get("filed_date", "")))
+            q3_9m = matching_9m[0]
 
         q4_val = float(ten_k["val"]) - float(q3_9m["val"])
         d_q3_end = datetime.strptime(str(q3_9m["period_end"]), "%Y-%m-%d")

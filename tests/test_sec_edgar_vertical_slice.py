@@ -297,9 +297,14 @@ def test_as_of_2024_01_15_returns_fy2023_q4(real_duckdb):
     assert abs(res["growth_yoy"] - expected_growth) < 1e-6
     assert abs(res["growth_yoy"] - (-0.007188)) < 1e-4
 
-    # Assert source_accessions contains both 10-K and 10-Q accession numbers
-    assert "0000320193-23-000106" in res["source_accessions"]
-    assert "0000320193-23-000077" in res["source_accessions"]
+    # Assert source_accessions contains all 4 accession numbers (both 10-K and 10-Q for FY23 and FY22)
+    assert len(res["source_accessions"]) == 4
+    assert res["source_accessions"] == [
+        "0000320193-22-000070",  # FY22 Q3 10-Q (original filed 2022-07-29)
+        "0000320193-22-000108",  # FY22 10-K (filed 2022-10-28)
+        "0000320193-23-000077",  # FY23 Q3 10-Q (filed 2023-08-04)
+        "0000320193-23-000106",  # FY23 10-K (filed 2023-11-03)
+    ]
 
     # Direct helper verification
     derived_q4 = reader.get_derived_q4_fundamental(
@@ -376,3 +381,21 @@ def test_missing_9m_data_prevents_derivation(test_db):
 
     growth = calculate_quarterly_revenue_growth_yoy(reader, cik, as_of)
     assert growth is None, "Expected None when 9M filing is missing"
+
+
+def test_exact_sec_acceptance_datetime_preserved(real_duckdb):
+    """
+    Assert accepted_datetime comes from the actual SEC acceptance timestamp,
+    e.g. 2023-11-02T22:08:27Z for Form 10-K (accession 0000320193-23-000106).
+    """
+    reader = EquityPITReader(real_duckdb)
+    as_of = datetime(2024, 1, 15, 0, 0, tzinfo=timezone.utc)
+    q4_23 = reader.get_derived_q4_fundamental(
+        "0000320193", "RevenueFromContractWithCustomerExcludingAssessedTax", 2023, as_of
+    )
+    assert q4_23 is not None
+    acc_dt = q4_23["accepted_datetime"]
+    assert acc_dt.hour != 0 or acc_dt.minute != 0 or acc_dt.second != 0
+    acc_utc = acc_dt.astimezone(timezone.utc)
+    assert acc_utc.hour == 22 and acc_utc.minute == 8 and acc_utc.second == 27
+
