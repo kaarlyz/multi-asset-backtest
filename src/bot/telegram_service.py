@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Set, Union
 import httpx
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ class TelegramBotService:
         allowed_user_ids: Optional[Union[List[Union[int, str]], Set[Union[int, str]], str]] = None,
         replay_engine: Optional[HistoricalReplayEngine] = None,
         db: Optional[ChronosDB] = None,
-        portfolio: Optional[Dict[str, Any]] = None,
+        portfolio: Optional[Union[Dict[str, Any], Any]] = None,
         http_client: Optional[httpx.Client] = None,
         env_path: Optional[Union[str, Path]] = None,
     ):
@@ -45,7 +46,7 @@ class TelegramBotService:
 
         self.replay_engine = replay_engine
         self.db = db
-        self.portfolio = portfolio or {
+        self.portfolio: Any = portfolio or {
             "cash": 100000.0,
             "equity": 100000.0,
             "open_positions": [],
@@ -54,6 +55,125 @@ class TelegramBotService:
         }
         self.http_client = http_client or httpx.Client(timeout=10.0)
         self.base_url = f"https://api.telegram.org/bot{self.token}"
+
+        self.sim_runner: Optional[Any] = None
+        self.sim_thread: Optional[threading.Thread] = None
+
+    def is_sim_running(self) -> bool:
+        return bool(self.sim_thread and self.sim_thread.is_alive())
+
+    def _parse_date(self, date_str: str, is_end: bool = False) -> datetime:
+        try:
+            dt = datetime.fromisoformat(date_str)
+        except Exception:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if is_end and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt
+
+    def start_simulation(
+        self,
+        asset: str = "BTCUSDT",
+        start_date: str = "2024-01-01",
+        end_date: str = "2024-03-31",
+        interval: str = "1d",
+        chat_id: Optional[Union[int, str]] = None,
+        step_delay: float = 2.0,
+    ) -> Any:
+        from src.engine.portfolio import SimPortfolio
+        from src.engine.runner import SimulationRunner
+        from src.orchestrator import MultiAgentOrchestrator
+
+        project_root = Path(__file__).resolve().parent.parent.parent
+
+        if self.db is None:
+            default_db = project_root / "data" / "chronos.duckdb"
+            self.db = ChronosDB(str(default_db))
+
+        base_asset = asset.replace("USDT", "")
+        try:
+            self.db.insert_asset(
+                asset_id=f"CRYPTO_{base_asset}",
+                asset_class="CRYPTO",
+                symbol=asset,
+                base_asset=base_asset,
+                quote_asset="USDT",
+                is_active=True,
+            )
+        except Exception:
+            pass
+
+        market_dir = project_root / "data" / "parquet" / "market" / "CRYPTO" / asset
+        market_path = market_dir / f"interval={interval}"
+        if not market_path.exists():
+            market_path = market_dir
+        market_data = market_path if market_path.exists() else None
+
+        start_dt = self._parse_date(start_date, is_end=False)
+        end_dt = self._parse_date(end_date, is_end=True)
+
+        replay_engine = HistoricalReplayEngine(
+            db=self.db,
+            symbol=asset,
+            start_time=start_dt,
+            end_time=end_dt,
+            step_size=interval,
+            interval=interval,
+            market_data=market_data,
+        )
+
+        orchestrator = MultiAgentOrchestrator(
+            replay_engine=replay_engine,
+            db=self.db,
+        )
+
+        portfolio = SimPortfolio(initial_cash=10000.0)
+
+        runner = SimulationRunner(
+            replay_engine=replay_engine,
+            orchestrator=orchestrator,
+            portfolio=portfolio,
+            telegram_service=self,
+            mode="INTERACTIVE",
+            step_delay=step_delay,
+            auto_listener=False,
+        )
+
+        self.sim_runner = runner
+        self.replay_engine = replay_engine
+        self.portfolio = portfolio
+
+        def _worker():
+            try:
+                runner.run()
+                if chat_id and not runner.is_stopped:
+                    self.send_message(
+                        chat_id=chat_id,
+                        text=f"🏁 Simulasi {asset} selesai!\n\n{self._build_portfolio_report()}",
+                    )
+            except Exception as e:
+                if chat_id and not runner.is_stopped:
+                    self.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ Error dalam simulasi {asset}: {e}",
+                    )
+
+        self.sim_thread = threading.Thread(target=_worker, name=f"SimRunner-{asset}", daemon=True)
+        self.sim_thread.start()
+        return runner
+
+    def stop_simulation(self) -> Dict[str, Any]:
+        """Halt active simulation runner and worker thread."""
+        if self.sim_runner is not None and hasattr(self.sim_runner, "stop"):
+            self.sim_runner.stop()
+        if self.sim_thread is not None and self.sim_thread.is_alive():
+            self.sim_thread.join(timeout=3.0)
+
+        if hasattr(self.portfolio, "get_summary"):
+            return self.portfolio.get_summary()
+        return self.portfolio if isinstance(self.portfolio, dict) else {}
 
     def _parse_allowed_user_ids(
         self, allowed: Union[List[Union[int, str]], Set[Union[int, str]], str]
@@ -158,12 +278,40 @@ class TelegramBotService:
             reply_text = (
                 f"🤖 Chronos Central Bot (@{self.bot_username})\n\n"
                 "Available commands:\n"
+                "/start_sim [ASSET] [START] [END] - Start interactive simulation\n"
+                "/stop_sim - Stop active simulation and show portfolio\n"
                 "/status - Current simulation and replay status\n"
                 "/portfolio - Simulation cash, equity, open positions, PnL\n"
                 "/report - Latest fundamental snapshot & quant metrics\n"
                 "/pause - Pause replay loop\n"
                 "/resume - Resume replay loop"
             )
+        elif cmd == "/start_sim":
+            if self.is_sim_running():
+                reply_text = "⚠️ Simulasi sedang berjalan. Hentikan dulu dengan /stop_sim sebelum memulai yang baru."
+            else:
+                parts = text.split()
+                asset = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
+                start_date = parts[2] if len(parts) > 2 else "2024-01-01"
+                end_date = parts[3] if len(parts) > 3 else "2024-03-31"
+
+                try:
+                    self.start_simulation(
+                        asset=asset,
+                        start_date=start_date,
+                        end_date=end_date,
+                        chat_id=chat_id,
+                        step_delay=2.0,
+                    )
+                    reply_text = f"🚀 Simulasi {asset} dimulai ({start_date} s/d {end_date}). Mode: INTERACTIVE."
+                except Exception as e:
+                    reply_text = f"❌ Gagal memulai simulasi: {e}"
+        elif cmd == "/stop_sim":
+            if not self.is_sim_running() and (self.sim_runner is None or getattr(self.sim_runner, "is_stopped", True)):
+                reply_text = "⚠️ Tidak ada simulasi yang sedang berjalan."
+            else:
+                self.stop_simulation()
+                reply_text = f"🛑 Simulasi dihentikan.\n\n{self._build_portfolio_report()}"
         elif cmd == "/status":
             reply_text = self._build_status_report()
         elif cmd == "/portfolio":
@@ -202,7 +350,17 @@ class TelegramBotService:
             return "⚠️ No active replay engine attached."
 
         eng = self.replay_engine
-        state_str = "PAUSED ⏸️" if eng.is_paused else ("FINISHED 🏁" if eng.is_finished() else "RUNNING ▶️")
+        if eng.is_paused:
+            state_str = "PAUSED ⏸️"
+        elif self.is_sim_running():
+            state_str = "RUNNING ▶️"
+        elif eng.is_finished():
+            state_str = "FINISHED 🏁"
+        elif self.sim_runner and getattr(self.sim_runner, "is_stopped", False):
+            state_str = "STOPPED 🛑"
+        else:
+            state_str = "RUNNING ▶️"
+
         sim_time_str = eng.current_sim_time.strftime("%Y-%m-%d %H:%M:%S UTC")
         bar = eng.get_current_bar()
         current_price = f"${bar['close']:,.2f}" if bar and "close" in bar else "N/A"
@@ -219,11 +377,20 @@ class TelegramBotService:
 
     def _build_portfolio_report(self) -> str:
         port = self.portfolio
-        cash = port.get("cash", 0.0)
-        equity = port.get("equity", 0.0)
-        positions = port.get("open_positions", [])
-        unrealized_pnl = port.get("unrealized_pnl", 0.0)
-        realized_pnl = port.get("realized_pnl", 0.0)
+        if hasattr(port, "cash"):
+            cash = getattr(port, "cash", 0.0)
+            equity = getattr(port, "equity", 0.0)
+            unrealized_pnl = getattr(port, "unrealized_pnl", 0.0)
+            realized_pnl = getattr(port, "realized_pnl", 0.0)
+            positions = getattr(port, "open_positions", {})
+        elif isinstance(port, dict):
+            cash = port.get("cash", 0.0)
+            equity = port.get("equity", 0.0)
+            unrealized_pnl = port.get("unrealized_pnl", 0.0)
+            realized_pnl = port.get("realized_pnl", 0.0)
+            positions = port.get("open_positions", [])
+        else:
+            cash, equity, unrealized_pnl, realized_pnl, positions = 0.0, 0.0, 0.0, 0.0, []
 
         pos_str = "None"
         if positions:

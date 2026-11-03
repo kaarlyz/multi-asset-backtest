@@ -243,3 +243,147 @@ def test_duplicate_callback_rejected_by_idempotency_guard(bot_service):
     # Original decision remains intact
     record = bot_service.db.get_decision(decision_id)
     assert record["action"] == "BUY"
+
+
+def test_start_sim_and_stop_sim_lifecycle(bot_service):
+    """
+    Verify /start_sim starts background interactive simulation thread,
+    /status, /portfolio, /report reflect active run,
+    concurrent /start_sim replies with warning,
+    and /stop_sim halts thread cleanly returning portfolio summary.
+    """
+    auth_id = 6526833205
+
+    # 1. Start simulation
+    res_start = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/start_sim BTCUSDT 2024-01-01 2024-01-05",
+    })
+    assert res_start["status"] == "HANDLED"
+    assert "🚀 Simulasi BTCUSDT dimulai (2024-01-01 s/d 2024-01-05). Mode: INTERACTIVE." in res_start["response"]
+
+    # Verify simulation thread is alive and configured
+    assert bot_service.is_sim_running() is True
+    assert bot_service.sim_thread is not None
+    assert bot_service.sim_thread.is_alive() is True
+    assert bot_service.sim_runner is not None
+    assert bot_service.sim_runner.mode == "INTERACTIVE"
+    assert bot_service.sim_runner.step_delay == 2.0
+    assert bot_service.replay_engine.active_asset == "BTCUSDT"
+
+    # 2. Verify /status reflects active run
+    res_status = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/status",
+    })
+    assert res_status["status"] == "HANDLED"
+    assert "SIMULATION STATUS:" in res_status["response"]
+    assert "Active Asset: BTCUSDT" in res_status["response"]
+    assert "RUNNING ▶️" in res_status["response"]
+
+    # 3. Verify /portfolio reflects active run
+    res_port = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/portfolio",
+    })
+    assert res_port["status"] == "HANDLED"
+    assert "PORTFOLIO SUMMARY:" in res_port["response"]
+    assert "Cash: $10,000.00" in res_port["response"]
+
+    # 4. Verify /report reflects active asset
+    res_report = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/report",
+    })
+    assert res_report["status"] == "HANDLED"
+    assert "PIT FUNDAMENTAL & QUANT REPORT (BTCUSDT):" in res_report["response"]
+
+    # 5. Starting another simulation while one is active returns warning
+    res_conflict = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/start_sim ETHUSDT 2024-01-01 2024-01-05",
+    })
+    assert res_conflict["status"] == "HANDLED"
+    assert "⚠️ Simulasi sedang berjalan" in res_conflict["response"]
+
+    # 6. Stop simulation via /stop_sim
+    res_stop = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/stop_sim",
+    })
+    assert res_stop["status"] == "HANDLED"
+    assert "🛑 Simulasi dihentikan." in res_stop["response"]
+    assert "PORTFOLIO SUMMARY:" in res_stop["response"]
+
+    # Thread and runner state checks
+    assert bot_service.is_sim_running() is False
+    assert bot_service.sim_thread.is_alive() is False
+    assert bot_service.sim_runner.is_stopped is True
+
+    # 7. Calling /stop_sim when no simulation is running
+    res_stop_again = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/stop_sim",
+    })
+    assert res_stop_again["status"] == "HANDLED"
+    assert "⚠️ Tidak ada simulasi yang sedang berjalan." in res_stop_again["response"]
+
+
+def test_start_sim_default_arguments(bot_service):
+    """Verify /start_sim applies default syntax: BTCUSDT 2024-01-01 2024-03-31."""
+    auth_id = 6526833205
+
+    res = bot_service.handle_message({
+        "from": {"id": auth_id},
+        "chat": {"id": auth_id},
+        "text": "/start_sim",
+    })
+    assert res["status"] == "HANDLED"
+    assert "🚀 Simulasi BTCUSDT dimulai (2024-01-01 s/d 2024-03-31). Mode: INTERACTIVE." in res["response"]
+    assert bot_service.is_sim_running() is True
+
+    # Clean up
+    bot_service.stop_simulation()
+    assert bot_service.is_sim_running() is False
+
+
+def test_start_sim_and_stop_sim_unauthorized(bot_service):
+    """Verify unauthorized users cannot execute /start_sim or /stop_sim."""
+    unauthorized_id = 111222333
+
+    res_start = bot_service.handle_message({
+        "from": {"id": unauthorized_id},
+        "chat": {"id": unauthorized_id},
+        "text": "/start_sim BTCUSDT",
+    })
+    assert res_start["status"] == "DROPPED_UNAUTHORIZED"
+    assert bot_service.is_sim_running() is False
+
+    res_stop = bot_service.handle_message({
+        "from": {"id": unauthorized_id},
+        "chat": {"id": unauthorized_id},
+        "text": "/stop_sim",
+    })
+    assert res_stop["status"] == "DROPPED_UNAUTHORIZED"
+
+
+def test_bot_daemon_lifecycle_and_shutdown(test_db):
+    """Verify BotDaemon initializes, polls safely, and handles shutdown cleanly."""
+    from src.bot_daemon import BotDaemon
+
+    daemon = BotDaemon()
+    daemon.db = test_db
+    daemon.bot_service.db = test_db
+    # Signal daemon to stop immediately after start
+    daemon.stop_event.set()
+    daemon.run(poll_timeout=1)
+    assert daemon.stop_event.is_set()
+
+

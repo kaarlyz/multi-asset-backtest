@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from src.bot.telegram_service import TelegramBotService
+if TYPE_CHECKING:
+    from src.bot.telegram_service import TelegramBotService
 from src.chronos.replay import HistoricalReplayEngine
 from src.engine.portfolio import SimPortfolio
 from src.orchestrator import MultiAgentOrchestrator
@@ -21,11 +22,12 @@ class SimulationRunner:
         replay_engine: HistoricalReplayEngine,
         orchestrator: MultiAgentOrchestrator,
         portfolio: SimPortfolio,
-        telegram_service: Optional[TelegramBotService] = None,
+        telegram_service: Optional["TelegramBotService"] = None,
         mode: str = "AUTONOMOUS",
         step_delay: float = 0.0,
         decision_timeout: float = 300.0,
         poll_interval: float = 0.1,
+        auto_listener: bool = True,
     ):
         self.replay_engine = replay_engine
         self.orchestrator = orchestrator
@@ -35,8 +37,10 @@ class SimulationRunner:
         self.step_delay = float(step_delay)
         self.decision_timeout = float(decision_timeout)
         self.poll_interval = float(poll_interval)
+        self.auto_listener = auto_listener
 
         self._waiting_for_decision = False
+        self._stop_requested = threading.Event()
         self._stop_listener = threading.Event()
         self._listener_thread: Optional[threading.Thread] = None
 
@@ -67,6 +71,17 @@ class SimulationRunner:
         if len(positions) == 1:
             return next(iter(positions.values()))
         return None
+
+    def stop(self) -> None:
+        """Signal runner to halt execution immediately."""
+        self._stop_requested.set()
+        self.stop_command_listener()
+        if self.replay_engine and self.replay_engine.is_paused:
+            self.replay_engine.resume()
+
+    @property
+    def is_stopped(self) -> bool:
+        return self._stop_requested.is_set()
 
     def start_command_listener(self) -> None:
         """Start background daemon thread for Telegram command polling."""
@@ -109,8 +124,17 @@ class SimulationRunner:
         5. In INTERACTIVE mode: prompt Telegram, pause clock, wait for callback, execute chosen action, resume.
         """
         # 1. Handle user manual pause
-        while self.replay_engine.is_paused and not self._waiting_for_decision and not self._stop_listener.is_set():
-            time.sleep(0.2)
+        while self.replay_engine.is_paused and not self._waiting_for_decision and not self._stop_listener.is_set() and not self._stop_requested.is_set():
+            time.sleep(0.1)
+
+        if self._stop_requested.is_set():
+            return {
+                "step_output": {},
+                "bar": self.replay_engine.get_current_bar(),
+                "executed_action": None,
+                "closed_trades": [],
+                "portfolio": self.portfolio.get_summary() if hasattr(self.portfolio, "get_summary") else {},
+            }
 
         # 2. Advance replay and run multi-agent pipeline
         step_out = self.orchestrator.step(advance=True)
@@ -211,7 +235,7 @@ class SimulationRunner:
                 chosen_actor = "TELEGRAM_USER"
 
                 try:
-                    while (time.time() - start_wait) < self.decision_timeout:
+                    while (time.time() - start_wait) < self.decision_timeout and not self._stop_requested.is_set():
                         if self.replay_engine.db:
                             rec = self.replay_engine.db.get_decision(decision_id)
                             if rec and rec.get("status") == "RECORDED":
@@ -222,6 +246,15 @@ class SimulationRunner:
                 finally:
                     self._waiting_for_decision = False
                     self.replay_engine.resume()
+
+                if self._stop_requested.is_set():
+                    return {
+                        "step_output": step_out,
+                        "bar": bar,
+                        "executed_action": "STOPPED",
+                        "closed_trades": closed_in_bar,
+                        "portfolio": self.portfolio.get_summary() if hasattr(self.portfolio, "get_summary") else {},
+                    }
 
                 # Process decision outcome
                 if chosen_action is None:
@@ -254,17 +287,19 @@ class SimulationRunner:
         Run orchestration loop to completion or until max_steps.
         Returns final portfolio summary.
         """
-        self.start_command_listener()
+        if self.auto_listener:
+            self.start_command_listener()
         steps = 0
         try:
-            while not self.replay_engine.is_finished():
+            while not self.replay_engine.is_finished() and not self._stop_requested.is_set():
                 if max_steps is not None and steps >= max_steps:
                     break
                 self.step()
                 steps += 1
-                if self.step_delay > 0:
-                    time.sleep(self.step_delay)
+                if self.step_delay > 0 and not self._stop_requested.is_set():
+                    self._stop_requested.wait(timeout=self.step_delay)
         finally:
-            self.stop_command_listener()
+            if self.auto_listener:
+                self.stop_command_listener()
 
-        return self.portfolio.get_summary()
+        return self.portfolio.get_summary() if hasattr(self.portfolio, "get_summary") else {}
