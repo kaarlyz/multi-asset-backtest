@@ -35,7 +35,7 @@ class EquityPITReader:
         fiscal_year: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         query = """
-            SELECT cik, entity_name, concept, accession_number, form, filed_date,
+            SELECT cik, entity_name, concept, canonical_metric, original_concept, accession_number, form, filed_date,
                    accepted_datetime, period_start, period_end, fiscal_year,
                    fiscal_period, val, unit
             FROM fact_sec_fundamentals_pit
@@ -288,7 +288,7 @@ class EquityPITReader:
         cik_str = str(cik).zfill(10)
 
         query = """
-            SELECT cik, entity_name, concept, accession_number, form, filed_date,
+            SELECT cik, entity_name, concept, canonical_metric, original_concept, accession_number, form, filed_date,
                    accepted_datetime, period_start, period_end, fiscal_year,
                    fiscal_period, val, unit
             FROM fact_sec_fundamentals_pit
@@ -305,6 +305,40 @@ class EquityPITReader:
         for row in rows:
             rec = dict(zip(cols, row))
             # Verify no leak
+            rec_accepted = rec["accepted_datetime"]
+            if hasattr(rec_accepted, "tzinfo") and rec_accepted.tzinfo is None:
+                rec_accepted = rec_accepted.replace(tzinfo=timezone.utc)
+            if rec_accepted <= as_of_utc:
+                results.append(rec)
+        return results
+
+    def get_canonical_history(
+        self, cik: str, canonical_metric: str, as_of_datetime: datetime
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve all filings for (cik, canonical_metric) available as of as_of_datetime,
+        strictly adhering to accepted_datetime <= as_of_datetime.
+        """
+        as_of_utc = self._normalize_datetime(as_of_datetime)
+        cik_str = str(cik).zfill(10)
+
+        query = """
+            SELECT cik, entity_name, concept, canonical_metric, original_concept, accession_number, form, filed_date,
+                   accepted_datetime, period_start, period_end, fiscal_year,
+                   fiscal_period, val, unit
+            FROM fact_sec_fundamentals_pit
+            WHERE cik = ? AND canonical_metric = ? AND accepted_datetime <= ?
+            ORDER BY period_end ASC, accepted_datetime ASC
+        """
+        with self.db._lock:
+            cursor = self.db.conn.cursor()
+            cursor.execute(query, [cik_str, canonical_metric, as_of_utc])
+            cols = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            rec = dict(zip(cols, row))
             rec_accepted = rec["accepted_datetime"]
             if hasattr(rec_accepted, "tzinfo") and rec_accepted.tzinfo is None:
                 rec_accepted = rec_accepted.replace(tzinfo=timezone.utc)

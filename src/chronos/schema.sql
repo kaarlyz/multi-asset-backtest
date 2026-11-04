@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS fact_sec_fundamentals_pit (
     cik VARCHAR NOT NULL,
     entity_name VARCHAR NOT NULL,
     concept VARCHAR NOT NULL,
+    canonical_metric VARCHAR,
+    original_concept VARCHAR,
     accession_number VARCHAR NOT NULL,
     form VARCHAR NOT NULL,
     filed_date VARCHAR NOT NULL,
@@ -77,4 +79,6 @@ CREATE TABLE IF NOT EXISTS fact_sec_fundamentals_pit (
 
 CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_pit_asof ON fact_sec_fundamentals_pit(cik, concept, accepted_datetime);
 CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_pit_period ON fact_sec_fundamentals_pit(cik, concept, period_end, accepted_datetime);
+CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_pit_canonical ON fact_sec_fundamentals_pit(cik, canonical_metric, accepted_datetime);
+CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_pit_canonical_period ON fact_sec_fundamentals_pit(cik, canonical_metric, period_end, accepted_datetime);
 

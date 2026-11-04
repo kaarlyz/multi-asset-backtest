@@ -20,6 +20,11 @@ class ChronosDB:
         with open(schema_path, "r", encoding="utf-8") as f:
             sql = f.read()
         with self._lock:
+            try:
+                self.conn.execute("ALTER TABLE fact_sec_fundamentals_pit ADD COLUMN IF NOT EXISTS canonical_metric VARCHAR")
+                self.conn.execute("ALTER TABLE fact_sec_fundamentals_pit ADD COLUMN IF NOT EXISTS original_concept VARCHAR")
+            except Exception:
+                pass
             self.conn.execute(sql)
 
     def insert_asset(
@@ -87,19 +92,23 @@ class ChronosDB:
         fiscal_period: str,
         val: float,
         unit: str,
+        canonical_metric: Optional[str] = None,
+        original_concept: Optional[str] = None,
     ) -> None:
         with self._lock:
             self.conn.execute(
                 """
                 INSERT OR REPLACE INTO fact_sec_fundamentals_pit
-                (cik, entity_name, concept, accession_number, form, filed_date, accepted_datetime,
+                (cik, entity_name, concept, canonical_metric, original_concept, accession_number, form, filed_date, accepted_datetime,
                  period_start, period_end, fiscal_year, fiscal_period, val, unit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     str(cik).zfill(10),
                     entity_name,
                     concept,
+                    canonical_metric,
+                    original_concept or concept,
                     accession_number,
                     form,
                     str(filed_date),
@@ -121,6 +130,8 @@ class ChronosDB:
                 str(r["cik"]).zfill(10),
                 r["entity_name"],
                 r["concept"],
+                r.get("canonical_metric"),
+                r.get("original_concept") or r["concept"],
                 r["accession_number"],
                 r["form"],
                 str(r["filed_date"]),
@@ -138,9 +149,9 @@ class ChronosDB:
             self.conn.executemany(
                 """
                 INSERT OR REPLACE INTO fact_sec_fundamentals_pit
-                (cik, entity_name, concept, accession_number, form, filed_date, accepted_datetime,
+                (cik, entity_name, concept, canonical_metric, original_concept, accession_number, form, filed_date, accepted_datetime,
                  period_start, period_end, fiscal_year, fiscal_period, val, unit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
